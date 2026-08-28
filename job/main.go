@@ -213,7 +213,7 @@ func init() {
 		return false
 	}).SetBlock(true).Handle(func(ctx *zero.Ctx) {
 		command := ctx.State["job_custom_command"].(string)
-		customHandler(command)(ctx)
+		ctx.SendChain(message.ParseMessageFromString(command)...)
 	})
 	en.OnRegex(`^记录在"(.*)"触发的(别名.*的)?指令$`, zero.UserOrGrpAdmin, isfirstregmatchnotnil, logevent).SetBlock(true).Handle(func(ctx *zero.Ctx) {
 		cron := ctx.State["regex_matched"].([]string)[1]
@@ -669,29 +669,6 @@ func listCustomTriggers(ctx *zero.Ctx) {
 	}
 	lines = append(lines, "[END")
 	ctx.SendChain(message.Text(strings.Join(lines, "\n")))
-}
-
-func customHandler(command string) zero.Handler {
-	cmdraw, _ := json.Marshal(command)
-	return func(ctx *zero.Ctx) {
-		ctx.Event.NativeMessage = cmdraw
-		ctx.Event.RawMessage = command
-		ctx.Event.Time = time.Now().Unix()
-		var err error
-		vev, cl := binary.OpenWriterF(func(w *binary.Writer) {
-			err = json.NewEncoder(w).Encode(ctx.Event)
-		})
-		if err != nil {
-			cl()
-			ctx.SendChain(message.Text("ERROR: ", err))
-			return
-		}
-		defer func() {
-			_ = recover()
-			cl()
-		}()
-		ctx.Echo(vev)
-	}
 }
 
 func parseArgs(ctx *zero.Ctx) bool {
