@@ -27,14 +27,35 @@ import (
 	"github.com/FloatTech/zbputils/vevent"
 )
 
+const help = `- 记录以"完全匹配关键词"触发的指令
+- 取消以"完全匹配关键词"触发的指令
+- 记录在"cron"触发的(别名xxx的)指令
+- 取消在"cron"触发的指令
+- 查看所有触发指令
+- 查看在"cron"触发的指令
+- 查看以"完全匹配关键词"触发的指令
+- 注入指令结果：任意指令
+- 执行指令：任意指令
+- [我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]
+- [查看|看看][我|大家|有人][说|问][正则表达式]
+- 删除[大家|有人|我][说|问|让你做|让你执行][正则表达式]
+- 添加群 [群号]（仅主人私聊）
+- 删除群 [群号]（仅主人私聊）
+- 添加群触发器 "触发词" 执行指令（仅主人私聊）
+- 删除群触发器 "触发词"（仅主人私聊）
+- 查看群列表（仅主人私聊）
+- 查看群触发器（仅主人私聊）`
+
 var (
-	entries  = map[int64]cron.EntryID{} // id entryid
-	matchers = map[int64]*zero.Matcher{}
-	mu       sync.RWMutex
-	en       = control.Register("job", &ctrl.Options[*zero.Ctx]{
+	entries        = map[int64]cron.EntryID{} // id entryid
+	matchers       = map[int64]*zero.Matcher{}
+	customGroups   = map[int64]map[int64]bool{} // bot -> group id
+	customTriggers = map[int64]map[int64]customTrigger{}
+	mu             sync.RWMutex
+	en             = control.Register("job", &ctrl.Options[*zero.Ctx]{
 		DisableOnDefault:  false,
 		Brief:             "定时指令触发器",
-		Help:              "- 记录以\"完全匹配关键词\"触发的指令\n- 取消以\"完全匹配关键词\"触发的指令\n- 记录在\"cron\"触发的(别名xxx的)指令\n- 取消在\"cron\"触发的指令\n- 查看所有触发指令\n- 查看在\"cron\"触发的指令\n- 查看以\"完全匹配关键词\"触发的指令\n- 注入指令结果：任意指令\n- 执行指令：任意指令\n- [我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]\n- [查看|看看][我|大家|有人][说|问][正则表达式]\n- 删除[大家|有人|我][说|问|让你做|让你执行][正则表达式]",
+		Help:              help,
 		PrivateDataFolder: "job",
 	})
 )
@@ -75,11 +96,11 @@ func init() {
 					return nil
 				}
 				if strings.HasPrefix(c.Cron, "rm:") || strings.HasPrefix(c.Cron, "im:") {
-					patttens := strings.SplitN(c.Cron, ":", 3)
-					if len(patttens) != 3 {
+					patterns := strings.SplitN(c.Cron, ":", 3)
+					if len(patterns) != 3 {
 						return errors.New("error regex match global pattern")
 					}
-					grp, err := strconv.ParseInt(patttens[1], 36, 64)
+					grp, err := strconv.ParseInt(patterns[1], 36, 64)
 					if err != nil {
 						return err
 					}
@@ -88,24 +109,29 @@ func init() {
 					}
 					tmpl := make([]byte, len(c.Cmd))
 					copy(tmpl, c.Cmd)
+					compiled, err := regexp.Compile(transformPattern(patterns[2]))
+					if err != nil {
+						logrus.WithError(err).Errorf("[job]跳过无效的全局正则任务 %d", c.ID)
+						return nil
+					}
 					global.group[grp].All = append(global.group[grp].All, inst{
-						regex:    regexp.MustCompile(transformPattern(patttens[2])),
-						Pattern:  patttens[2],
+						regex:    compiled,
+						Pattern:  patterns[2],
 						Template: binary.BytesToString(tmpl),
-						IsInject: patttens[0][0] == 'i',
+						IsInject: patterns[0][0] == 'i',
 					})
 					return nil
 				}
 				if strings.HasPrefix(c.Cron, "rp:") || strings.HasPrefix(c.Cron, "ip:") {
-					patttens := strings.SplitN(c.Cron, ":", 4)
-					if len(patttens) != 4 {
+					patterns := strings.SplitN(c.Cron, ":", 4)
+					if len(patterns) != 4 {
 						return errors.New("error regex match private pattern")
 					}
-					uid, err := strconv.ParseInt(patttens[1], 36, 64)
+					uid, err := strconv.ParseInt(patterns[1], 36, 64)
 					if err != nil {
 						return err
 					}
-					gid, err := strconv.ParseInt(patttens[2], 36, 64)
+					gid, err := strconv.ParseInt(patterns[2], 36, 64)
 					if err != nil {
 						return err
 					}
@@ -117,11 +143,16 @@ func init() {
 					if global.group[gid].Private == nil {
 						global.group[gid].Private = make(map[int64][]inst)
 					}
+					compiled, err := regexp.Compile(transformPattern(patterns[3]))
+					if err != nil {
+						logrus.WithError(err).Errorf("[job]跳过无效的私有正则任务 %d", c.ID)
+						return nil
+					}
 					global.group[gid].Private[uid] = append(global.group[gid].Private[uid], inst{
-						regex:    regexp.MustCompile(transformPattern(patttens[3])),
-						Pattern:  patttens[3],
+						regex:    compiled,
+						Pattern:  patterns[3],
 						Template: binary.BytesToString(tmpl),
-						IsInject: patttens[0][0] == 'i',
+						IsInject: patterns[0][0] == 'i',
 					})
 					return nil
 				}
@@ -133,14 +164,57 @@ func init() {
 				entries[c.ID] = eid
 				return nil
 			})
-			if err != nil && err != sql.ErrNullResult {
+			if err != nil && !errors.Is(err, sql.ErrNullResult) {
 				panic(err)
 			}
 			return true
 		})
+		_ = db.Create("custom_groups", &customGroup{})
+		_ = db.Create("custom_triggers", &customTrigger{})
+		g := &customGroup{}
+		t := &customTrigger{}
+		mu.Lock()
+		_ = db.FindFor("custom_groups", g, "", func() error {
+			if customGroups[g.BotID] == nil {
+				customGroups[g.BotID] = make(map[int64]bool)
+			}
+			customGroups[g.BotID][g.GroupID] = true
+			return nil
+		})
+		_ = db.FindFor("custom_triggers", t, "", func() error {
+			if customTriggers[t.BotID] == nil {
+				customTriggers[t.BotID] = make(map[int64]customTrigger)
+			}
+			customTriggers[t.BotID][t.ID] = *t
+			return nil
+		})
+		mu.Unlock()
 		logrus.Infoln("[job]本地环回初始化完成")
 		process.GlobalInitMutex.Unlock()
 	}()
+	en.OnRegex(`^添加群\s+(\d+)$`, zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(addCustomGroup)
+	en.OnRegex(`^删除群\s+(\d+)$`, zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(deleteCustomGroup)
+	en.OnRegex(`^添加群触发器\s+"([^"]+)"\s+(.+)$`, zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(addCustomTrigger)
+	en.OnRegex(`^删除群触发器\s+"([^"]+)"$`, zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(deleteCustomTrigger)
+	en.OnFullMatch("查看群列表", zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(listCustomGroups)
+	en.OnFullMatch("查看群触发器", zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(listCustomTriggers)
+	en.On(`message/group`, func(ctx *zero.Ctx) bool {
+		mu.RLock()
+		defer mu.RUnlock()
+		if !customGroups[ctx.Event.SelfID][ctx.Event.GroupID] {
+			return false
+		}
+		for _, j := range customTriggers[ctx.Event.SelfID] {
+			if j.Trigger == ctx.MessageString() {
+				ctx.State["job_custom_command"] = j.Command
+				return true
+			}
+		}
+		return false
+	}).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		command := ctx.State["job_custom_command"].(string)
+		customHandler(command)(ctx)
+	})
 	en.OnRegex(`^记录在"(.*)"触发的(别名.*的)?指令$`, zero.UserOrGrpAdmin, isfirstregmatchnotnil, logevent).SetBlock(true).Handle(func(ctx *zero.Ctx) {
 		cron := ctx.State["regex_matched"].([]string)[1]
 		alias := ctx.State["regex_matched"].([]string)[2]
@@ -229,11 +303,11 @@ func init() {
 		}
 		lst := make([]string, 0, n+2)
 		q := ""
-		args := []any{}
+		var args []any
 		if ctx.Event.GroupID != 0 {
 			grp := strconv.FormatInt(ctx.Event.GroupID, 36)
-			q = "WHERE cron LIKE 'fm:%' OR cron LIKE 'sm:%' OR cron LIKE ? OR cron LIKE ? "
-			args = []any{"_m:" + grp + ":%", "_p:" + grp + ":?:%"}
+			q = "WHERE cron LIKE 'fm:%' OR cron LIKE 'sm:%' OR cron LIKE ? OR cron LIKE ? OR cron LIKE ? OR cron LIKE ? "
+			args = []any{"rm:" + grp + ":%", "im:" + grp + ":%", "rp:" + grp + ":%", "ip:" + grp + ":%"}
 			lst = append(lst, "在本群的触发指令]\n")
 		} else {
 			lst = append(lst, "全部触发指令]\n")
@@ -424,12 +498,13 @@ func superuserhandler(rsp []byte) (zero.Handler, error) {
 		ctx.Event.RawMessage = e.RawMessage
 		ctx.Event.Sender = e.Sender
 		ctx.Event.NativeMessage = e.NativeMessage
+		var encodeErr error
 		vev, cl := binary.OpenWriterF(func(w *binary.Writer) {
-			err = json.NewEncoder(w).Encode(ctx.Event)
+			encodeErr = json.NewEncoder(w).Encode(ctx.Event)
 		})
-		if err != nil {
+		if encodeErr != nil {
 			cl()
-			ctx.SendChain(message.Text("ERROR: ", err))
+			ctx.SendChain(message.Text("ERROR: ", encodeErr))
 			return
 		}
 		logrus.Debugln("[job] inject:", binary.BytesToString(vev))
@@ -460,16 +535,15 @@ func rmcmd(bot, caller int64, cron string, force bool) error {
 		if ok {
 			process.CronTab.Remove(eid)
 			delete(entries, c.ID)
-			delids = append(delids, c.ID)
 		}
+		delids = append(delids, c.ID)
 		return nil
 	}, cron, cron+":->%")
 	if err != nil {
 		return err
 	}
 	if len(delids) > 0 {
-		q, s := sql.QuerySet("WHERE id", "IN", delids)
-		return db.Del(bots, q, s...)
+		return deletecmds(bots, delids)
 	}
 	return nil
 }
@@ -485,18 +559,139 @@ func delcmd(bot int64, cron string) error {
 		if ok {
 			m.Delete()
 			delete(matchers, c.ID)
-			delids = append(delids, c.ID)
 		}
+		delids = append(delids, c.ID)
 		return nil
 	}, cron)
 	if err != nil {
 		return err
 	}
 	if len(delids) > 0 {
-		q, s := sql.QuerySet("WHERE id", "IN", delids)
-		return db.Del(bots, q, s...)
+		return deletecmds(bots, delids)
 	}
 	return nil
+}
+
+func deletecmds(table string, ids []int64) error {
+	q, s := sql.QuerySet("WHERE id", "IN", ids)
+	err := db.Del(table, q, s...)
+	if err == nil || !strings.Contains(err.Error(), "readonly database") {
+		return err
+	}
+	// SQLITE_READONLY_DBMOVED means the database file was replaced or moved
+	// after SQLite opened it. Reopen once and retry against the current file.
+	if err = db.Close(); err != nil {
+		return err
+	}
+	if err = db.Open(time.Hour); err != nil {
+		return err
+	}
+	return db.Del(table, q, s...)
+}
+
+func addCustomGroup(ctx *zero.Ctx) {
+	gid, _ := strconv.ParseInt(ctx.State["regex_matched"].([]string)[1], 10, 64)
+	mu.Lock()
+	defer mu.Unlock()
+	g := customGroup{ID: idof("group", strconv.FormatInt(ctx.Event.SelfID, 10)+strconv.FormatInt(gid, 10)), BotID: ctx.Event.SelfID, GroupID: gid}
+	if err := db.Insert("custom_groups", &g); err != nil {
+		ctx.SendChain(message.Text("ERROR: ", err))
+		return
+	}
+	if customGroups[g.BotID] == nil {
+		customGroups[g.BotID] = make(map[int64]bool)
+	}
+	customGroups[g.BotID][gid] = true
+	ctx.SendChain(message.Text("成功"))
+}
+
+func deleteCustomGroup(ctx *zero.Ctx) {
+	gid, _ := strconv.ParseInt(ctx.State["regex_matched"].([]string)[1], 10, 64)
+	mu.Lock()
+	defer mu.Unlock()
+	if err := db.Del("custom_groups", "WHERE bot_id = ? AND group_id = ?", ctx.Event.SelfID, gid); err != nil {
+		ctx.SendChain(message.Text("ERROR: ", err))
+		return
+	}
+	delete(customGroups[ctx.Event.SelfID], gid)
+	ctx.SendChain(message.Text("成功"))
+}
+
+func addCustomTrigger(ctx *zero.Ctx) {
+	m := ctx.State["regex_matched"].([]string)
+	t := customTrigger{ID: idof(m[1], m[2]), BotID: ctx.Event.SelfID, Trigger: m[1], Command: strings.TrimSpace(m[2])}
+	mu.Lock()
+	defer mu.Unlock()
+	if err := db.Insert("custom_triggers", &t); err != nil {
+		ctx.SendChain(message.Text("ERROR: ", err))
+		return
+	}
+	if customTriggers[t.BotID] == nil {
+		customTriggers[t.BotID] = make(map[int64]customTrigger)
+	}
+	customTriggers[t.BotID][t.ID] = t
+	ctx.SendChain(message.Text("成功"))
+}
+
+func deleteCustomTrigger(ctx *zero.Ctx) {
+	trigger := ctx.State["regex_matched"].([]string)[1]
+	mu.Lock()
+	defer mu.Unlock()
+	if err := db.Del("custom_triggers", "WHERE bot_id = ? AND trigger = ?", ctx.Event.SelfID, trigger); err != nil {
+		ctx.SendChain(message.Text("ERROR: ", err))
+		return
+	}
+	for id, t := range customTriggers[ctx.Event.SelfID] {
+		if t.Trigger == trigger {
+			delete(customTriggers[ctx.Event.SelfID], id)
+		}
+	}
+	ctx.SendChain(message.Text("成功"))
+}
+
+func listCustomGroups(ctx *zero.Ctx) {
+	mu.RLock()
+	defer mu.RUnlock()
+	lines := []string{"[群列表]"}
+	for gid := range customGroups[ctx.Event.SelfID] {
+		lines = append(lines, strconv.FormatInt(gid, 10))
+	}
+	lines = append(lines, "[END")
+	ctx.SendChain(message.Text(strings.Join(lines, "\n")))
+}
+
+func listCustomTriggers(ctx *zero.Ctx) {
+	mu.RLock()
+	defer mu.RUnlock()
+	lines := []string{"[群触发器]"}
+	for _, t := range customTriggers[ctx.Event.SelfID] {
+		lines = append(lines, "\""+t.Trigger+"\" -> "+t.Command)
+	}
+	lines = append(lines, "[END")
+	ctx.SendChain(message.Text(strings.Join(lines, "\n")))
+}
+
+func customHandler(command string) zero.Handler {
+	cmdraw, _ := json.Marshal(command)
+	return func(ctx *zero.Ctx) {
+		ctx.Event.NativeMessage = cmdraw
+		ctx.Event.RawMessage = command
+		ctx.Event.Time = time.Now().Unix()
+		var err error
+		vev, cl := binary.OpenWriterF(func(w *binary.Writer) {
+			err = json.NewEncoder(w).Encode(ctx.Event)
+		})
+		if err != nil {
+			cl()
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		defer func() {
+			_ = recover()
+			cl()
+		}()
+		ctx.Echo(vev)
+	}
 }
 
 func parseArgs(ctx *zero.Ctx) bool {
@@ -537,7 +732,7 @@ func parseArgs(ctx *zero.Ctx) bool {
 			select {
 			case <-time.After(time.Second * 120):
 				ctx.Send(message.ReplyWithMessage(id, message.Text("参数读取超时")))
-				if msg[0] != '?' {
+				if msg == "" || msg[0] != '?' {
 					return false
 				}
 			case c := <-zero.NewFutureEvent("message", 0, true, zero.CheckUser(ctx.Event.UserID)).Next():

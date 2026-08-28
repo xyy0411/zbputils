@@ -8,4 +8,17 @@ type cmd struct {
 	Cmd  string `db:"cmd"`
 }
 
+type customGroup struct {
+	ID      int64 `db:"id"`
+	BotID   int64 `db:"bot_id"`
+	GroupID int64 `db:"group_id"`
+}
+
+type customTrigger struct {
+	ID      int64  `db:"id"`
+	BotID   int64  `db:"bot_id"`
+	Trigger string `db:"trigger"`
+	Command string `db:"command"`
+}
+
 var db = sql.New(en.DataFolder() + "job.db")
