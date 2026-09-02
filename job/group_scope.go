@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	zero "github.com/wdvxdr1123/ZeroBot"
 )
@@ -16,44 +14,22 @@ type groupSelectionKey struct {
 	UserID int64
 }
 
-type groupSelectionValue struct {
-	GroupIDs []int64
-	Expires  time.Time
-}
-
-var groupSelections = struct {
-	sync.Mutex
-	values map[groupSelectionKey]groupSelectionValue
-}{values: make(map[groupSelectionKey]groupSelectionValue)}
-
 func registerGroupSelection(ctx *zero.Ctx, raw string) error {
 	ids, err := parseGroupIDs(raw)
 	if err != nil {
 		return err
 	}
 	key := groupSelectionKey{BotID: ctx.Event.SelfID, UserID: ctx.Event.UserID}
-	groupSelections.Lock()
-	groupSelections.values[key] = groupSelectionValue{
-		GroupIDs: ids,
-		Expires:  time.Now().Add(2 * time.Minute),
-	}
-	groupSelections.Unlock()
-	return nil
+	return jobs.saveGroups(key.BotID, key.UserID, ids)
 }
 
 func consumeGroupSelection(ctx *zero.Ctx) ([]int64, bool) {
 	key := groupSelectionKey{BotID: ctx.Event.SelfID, UserID: ctx.Event.UserID}
-	groupSelections.Lock()
-	defer groupSelections.Unlock()
-	selection, ok := groupSelections.values[key]
-	if !ok {
+	groups, err := jobs.groups(key.BotID, key.UserID)
+	if err != nil || len(groups) == 0 {
 		return nil, false
 	}
-	delete(groupSelections.values, key)
-	if time.Now().After(selection.Expires) {
-		return nil, false
-	}
-	return selection.GroupIDs, true
+	return groups, true
 }
 
 func parseGroupIDs(raw string) ([]int64, error) {

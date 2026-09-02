@@ -4,6 +4,7 @@ package job
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc64"
 	"strconv"
 	"strings"
@@ -30,7 +31,7 @@ var (
 	en      = control.Register("job", &ctrl.Options[*zero.Ctx]{
 		DisableOnDefault:  false,
 		Brief:             "定时指令触发器",
-		Help:              "- 设置指令群 群号1,群号2\n- 记录群指令在\"cron\"触发的指令\n- 记录群指令以\"完全匹配关键词\"触发的指令\n- 群指令[我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]\n- 记录以\"完全匹配关键词\"触发的指令\n- 记录在\"cron\"触发的指令\n- 取消以\"完全匹配关键词\"触发的指令\n- 取消在\"cron\"触发的指令\n- 查看所有触发指令\n- 查看在\"cron\"触发的指令\n- 查看以\"完全匹配关键词\"触发的指令\n- 注入指令结果：任意指令\n- 执行指令：任意指令\n- [我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]\n- [查看|看看][我|大家|有人][说|问][正则表达式]\n- 删除[大家|有人|我][说|问|让你做|让你执行][正则表达式]",
+		Help:              "- 设置指令群 群号1,群号2\n- 查看指令群\n- 查看群指令\n- 删除我的全部群指令\n- 记录群指令在\"cron\"触发的指令\n- 记录群指令以\"完全匹配关键词\"触发的指令\n- 群指令[我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]\n- 取消群指令在\"cron\"触发的指令\n- 取消群指令以\"完全匹配关键词\"触发的指令\n- 删除群指令[大家|有人|我][说|问|让你做|让你执行][正则表达式]\n- 记录以\"完全匹配关键词\"触发的指令\n- 记录在\"cron\"触发的指令\n- 取消以\"完全匹配关键词\"触发的指令\n- 取消在\"cron\"触发的指令\n- 查看所有触发指令\n- 查看在\"cron\"触发的指令\n- 查看以\"完全匹配关键词\"触发的指令\n- 注入指令结果：任意指令\n- 执行指令：任意指令\n- [我|大家|有人][说|问][正则表达式]你[答|说|做|执行][模版]\n- [查看|看看][我|大家|有人][说|问][正则表达式]\n- 删除[大家|有人|我][说|问|让你做|让你执行][正则表达式]",
 		PrivateDataFolder: "job",
 	})
 )
@@ -67,7 +68,73 @@ func registerCommandHandlers() {
 			ctx.SendChain(message.Text("ERROR: ", err))
 			return
 		}
-		ctx.SendChain(message.Text("已设置，下一条任务指令将应用到指定群"))
+		ctx.SendChain(message.Text("已设置，后续任务指令将永久应用到指定群"))
+	})
+	en.OnFullMatch("查看指令群", zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		groups, err := jobs.groups(ctx.Event.SelfID, ctx.Event.UserID)
+		if err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		if len(groups) == 0 {
+			ctx.SendChain(message.Text("尚未设置指令群"))
+			return
+		}
+		parts := make([]string, len(groups))
+		for i, groupID := range groups {
+			parts[i] = strconv.FormatInt(groupID, 10)
+		}
+		ctx.SendChain(message.Text("已设置指令群: ", strings.Join(parts, ",")))
+	})
+	en.OnFullMatch("查看群指令", zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		stored, err := tasks.list(ctx.Event.SelfID)
+		if err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		lines := make([]string, 0)
+		for _, task := range stored {
+			if !task.Scoped || task.OwnerID != ctx.Event.UserID {
+				continue
+			}
+			lines = append(lines, fmt.Sprintf("群 %d | %s | %s | 执行: %s", task.GroupID, task.legacyCron(), taskKindName(task.Kind), taskCommandText(task)))
+		}
+		if len(lines) == 0 {
+			ctx.SendChain(message.Text("尚未设置群指令"))
+			return
+		}
+		ctx.SendChain(message.Text(strings.Join(lines, "\n")))
+	})
+	en.OnFullMatch("删除我的全部群指令", zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		deleted, err := tasks.deleteWhere(ctx.Event.SelfID, func(task storedJob) (bool, error) {
+			return task.Scoped && task.OwnerID == ctx.Event.UserID, nil
+		})
+		if err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		ctx.SendChain(message.Text("已删除 ", deleted, " 条群指令"))
+	})
+	en.OnRegex(`^取消群指令在"(.*)"触发的指令$`, zero.SuperUserPermission, zero.OnlyPrivate, isfirstregmatchnotnil).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		cron := ctx.State["regex_matched"].([]string)[1]
+		err := deleteScopedCron(ctx.Event.SelfID, ctx.Event.UserID, cron)
+		if err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		ctx.SendChain(message.Text("成功!"))
+	})
+	en.OnRegex(`^取消群指令以"(.*)"触发的(代表我执行的)?指令$`, zero.SuperUserPermission, zero.OnlyPrivate, isfirstregmatchnotnil).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		matched := ctx.State["regex_matched"].([]string)
+		kind := storedFullMatch
+		if matched[2] != "" {
+			kind = storedSuperMatch
+		}
+		if err := deleteScopedMatch(ctx.Event.SelfID, ctx.Event.UserID, kind, matched[1]); err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		ctx.SendChain(message.Text("成功!"))
 	})
 	en.OnRegex(`^记录(群指令)?在"(.*)"触发的(别名.*的)?指令$`, zero.UserOrGrpAdmin, isfirstregmatchnotnil, logevent).SetBlock(true).Handle(func(ctx *zero.Ctx) {
 		cron := ctx.State["regex_matched"].([]string)[2]
@@ -285,6 +352,10 @@ func addcmd(ctx *zero.Ctx, c *cmd) error {
 	scoped := make([]storedJob, len(groups))
 	for i, groupID := range groups {
 		scoped[i] = setTaskGroup(task, groupID)
+		scoped[i].Scoped = selected
+		if selected {
+			scoped[i].OwnerID = ctx.Event.UserID
+		}
 	}
 	return tasks.addBatch(ctx.Event.SelfID, scoped)
 }
@@ -305,8 +376,71 @@ func registercmd(ctx *zero.Ctx, c *cmd) error {
 	scoped := make([]storedJob, len(groups))
 	for i, groupID := range groups {
 		scoped[i] = setTaskGroup(task, groupID)
+		scoped[i].Scoped = selected
+		if selected {
+			scoped[i].OwnerID = ctx.Event.UserID
+		}
 	}
 	return tasks.addBatch(bot, scoped)
+}
+
+func taskKindName(kind storedKind) string {
+	switch kind {
+	case storedCron:
+		return "定时"
+	case storedFullMatch:
+		return "完全匹配"
+	case storedSuperMatch:
+		return "代表我执行"
+	case storedRegexAllText:
+		return "大家问"
+	case storedRegexPrivateText:
+		return "我问"
+	case storedRegexAllInject:
+		return "大家执行"
+	case storedRegexPrivateInject:
+		return "我执行"
+	default:
+		return "未知"
+	}
+}
+
+func taskCommandText(task storedJob) string {
+	if task.Kind == storedCron || task.Kind == storedSuperMatch {
+		if event, err := decodeStoredEvent(task.Command); err == nil {
+			return event.RawMessage
+		}
+	}
+	if task.Kind >= storedRegexAllText {
+		return message.UnescapeCQCodeText(task.Command)
+	}
+	return decodeNativeHandler(task.Command)
+}
+
+func deleteScopedCron(bot, owner int64, cron string) error {
+	deleted, err := tasks.deleteWhere(bot, func(task storedJob) (bool, error) {
+		return task.Scoped && task.OwnerID == owner && task.Kind == storedCron && task.Schedule == cron, nil
+	})
+	if err != nil {
+		return err
+	}
+	if deleted == 0 {
+		return errors.New("没有找到对应的群指令")
+	}
+	return nil
+}
+
+func deleteScopedMatch(bot, owner int64, kind storedKind, matcher string) error {
+	deleted, err := tasks.deleteWhere(bot, func(task storedJob) (bool, error) {
+		return task.Scoped && task.OwnerID == owner && task.Kind == kind && task.Matcher == matcher, nil
+	})
+	if err != nil {
+		return err
+	}
+	if deleted == 0 {
+		return errors.New("没有找到对应的群指令")
+	}
+	return nil
 }
 
 func generalhandler(command string) zero.Handler {

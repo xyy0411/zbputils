@@ -32,6 +32,8 @@ type storedJob struct {
 	Command  string
 	GroupID  int64
 	UserID   int64
+	OwnerID  int64
+	Scoped   bool
 }
 
 func (k storedKind) databaseName() (string, error) {

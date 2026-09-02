@@ -158,6 +158,10 @@ func registerRegexQuestionHandlers() {
 		batch := make([]storedJob, len(groups))
 		for i, groupID := range groups {
 			batch[i] = newRegexTask(groupID, uid, pattern, template, isInject)
+			batch[i].Scoped = selected
+			if selected {
+				batch[i].OwnerID = ctx.Event.UserID
+			}
 		}
 		err := tasks.addBatch(ctx.Event.SelfID, batch)
 		if err != nil {
@@ -209,6 +213,43 @@ func registerRegexQuestionHandlers() {
 			show(rg.Private[uid])
 		}
 		ctx.SendChain(message.Text(w.String()))
+	})
+
+	en.OnRegex(`^删除群指令(大家|有人|我)(说|问|让你做|让你执行)`, zero.SuperUserPermission, zero.OnlyPrivate).SetBlock(true).Handle(func(ctx *zero.Ctx) {
+		matched := ctx.State["regex_matched"].([]string)
+		pattern := strings.TrimPrefix(ctx.MessageString(), matched[0])
+		escaped := message.UnescapeCQCodeText(pattern)
+		patterns := []string{pattern}
+		if escaped != pattern {
+			patterns = append(patterns, escaped)
+		}
+		uid := int64(0)
+		if matched[1] == "我" {
+			uid = ctx.Event.UserID
+		}
+		injecting := matched[2] == "让你做" || matched[2] == "让你执行"
+		deleted, err := tasks.deleteWhere(ctx.Event.SelfID, func(task storedJob) (bool, error) {
+			isRegex := task.Kind == storedRegexAllText || task.Kind == storedRegexPrivateText || task.Kind == storedRegexAllInject || task.Kind == storedRegexPrivateInject
+			isInject := task.Kind == storedRegexAllInject || task.Kind == storedRegexPrivateInject
+			if !task.Scoped || task.OwnerID != ctx.Event.UserID || !isRegex || isInject != injecting || task.UserID != uid {
+				return false, nil
+			}
+			for _, candidate := range patterns {
+				if task.Matcher == candidate {
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+		if err != nil {
+			ctx.SendChain(message.Text("ERROR: ", err))
+			return
+		}
+		if deleted == 0 {
+			ctx.SendChain(message.Text("ERROR: 没有找到对应的群指令"))
+			return
+		}
+		ctx.SendChain(message.Text("删除成功"))
 	})
 
 	en.OnRegex(`^删除(大家|有人|我)(说|问|让你做|让你执行)`, zero.OnlyGroup, zero.OnlyToMe).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {

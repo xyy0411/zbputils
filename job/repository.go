@@ -1,6 +1,7 @@
 package job
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 
@@ -8,6 +9,7 @@ import (
 )
 
 const jobTable = "job_records"
+const groupTable = "job_groups"
 
 type jobRow struct {
 	Key      string `db:"key"`
@@ -20,6 +22,15 @@ type jobRow struct {
 	Command  string `db:"command"`
 	GroupID  int64  `db:"group_id"`
 	UserID   int64  `db:"user_id"`
+	OwnerID  int64  `db:"owner_id"`
+	Scoped   bool   `db:"scoped"`
+}
+
+type groupRow struct {
+	Key      string `db:"key"`
+	BotID    int64  `db:"bot_id"`
+	UserID   int64  `db:"user_id"`
+	GroupIDs string `db:"group_ids"`
 }
 
 type repository struct {
@@ -35,7 +46,38 @@ type taskRepository interface {
 }
 
 func (r repository) initSchema() error {
-	return r.db.Create(jobTable, &jobRow{})
+	if err := r.db.Create(jobTable, &jobRow{}); err != nil {
+		return err
+	}
+	return r.db.Create(groupTable, &groupRow{})
+}
+
+func (r repository) saveGroups(botID, userID int64, groups []int64) error {
+	encoded, err := json.Marshal(groups)
+	if err != nil {
+		return err
+	}
+	key := groupKey(botID, userID)
+	if err := r.db.Del(groupTable, "WHERE key = ?", key); err != nil {
+		return err
+	}
+	return r.db.Insert(groupTable, &groupRow{Key: key, BotID: botID, UserID: userID, GroupIDs: string(encoded)})
+}
+
+func (r repository) groups(botID, userID int64) ([]int64, error) {
+	var row groupRow
+	err := r.db.FindFor(groupTable, &row, "WHERE key = ?", func() error { return nil }, groupKey(botID, userID))
+	if errors.Is(err, sql.ErrNullResult) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var groups []int64
+	if err := json.Unmarshal([]byte(row.GroupIDs), &groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
 }
 
 func (r repository) save(botID int64, task storedJob) error {
@@ -100,6 +142,8 @@ func newJobRow(botID int64, task storedJob) (jobRow, error) {
 		Command:  task.Command,
 		GroupID:  task.GroupID,
 		UserID:   task.UserID,
+		OwnerID:  task.OwnerID,
+		Scoped:   task.Scoped,
 	}, nil
 }
 
@@ -117,9 +161,15 @@ func (r jobRow) storedJob() (storedJob, error) {
 		Command:  r.Command,
 		GroupID:  r.GroupID,
 		UserID:   r.UserID,
+		OwnerID:  r.OwnerID,
+		Scoped:   r.Scoped,
 	}, nil
 }
 
 func jobKey(botID, taskID int64) string {
 	return strconv.FormatInt(botID, 10) + ":" + strconv.FormatInt(taskID, 10)
+}
+
+func groupKey(botID, userID int64) string {
+	return strconv.FormatInt(botID, 10) + ":" + strconv.FormatInt(userID, 10)
 }
