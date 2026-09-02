@@ -22,3 +22,7 @@ type customTrigger struct {
 }
 
 var db = sql.New(en.DataFolder() + "job.db")
+
+var jobs = repository{db: &db}
+
+var tasks = taskService{store: jobs, runtime: runtime}

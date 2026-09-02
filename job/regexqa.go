@@ -15,17 +15,20 @@ import (
 
 	"github.com/FloatTech/floatbox/binary"
 	"github.com/FloatTech/floatbox/process"
-	sql "github.com/FloatTech/sqlite"
-
 	"github.com/FloatTech/zbputils/ctxext"
 )
 
 var global = context{
-	group: make(map[int64]*regexGroup),
+	group: make(map[questionGroupKey]*regexGroup),
 }
 
 type context struct {
-	group map[int64]*regexGroup
+	group map[questionGroupKey]*regexGroup
+}
+
+type questionGroupKey struct {
+	BotID   int64
+	GroupID int64
 }
 
 type regexGroup struct {
@@ -34,13 +37,33 @@ type regexGroup struct {
 }
 
 type inst struct {
+	TaskID   int64
 	regex    *regexp.Regexp
 	Pattern  string
 	Template string
 	IsInject bool
 }
 
+func (c *context) get(botID, groupID int64) *regexGroup {
+	return c.group[questionGroupKey{BotID: botID, GroupID: groupID}]
+}
+
+func (c *context) ensure(botID, groupID int64) *regexGroup {
+	key := questionGroupKey{BotID: botID, GroupID: groupID}
+	group := c.group[key]
+	if group == nil {
+		group = &regexGroup{Private: make(map[int64][]inst)}
+		c.group[key] = group
+	} else if group.Private == nil {
+		group.Private = make(map[int64][]inst)
+	}
+	return group
+}
+
 var transformRegex = regexp.MustCompile(`<<.+?>>`)
+
+// ErrRegexNotFound 没有找到对应的问答词条
+var ErrRegexNotFound = errors.New("没有找到对应的问答词条")
 
 func transformPattern(pattern string) string {
 	pattern = transformRegex.ReplaceAllStringFunc(pattern, func(s string) string {
@@ -50,82 +73,59 @@ func transformPattern(pattern string) string {
 	return "^" + pattern + "$"
 }
 
-// isPrivate:false & id:0 is global
-func saveRegex(gid, uid int64, bots, pattern, template string) error {
-	cr := "rm:"
-	if uid > 0 {
-		cr = "rp:" + strconv.FormatInt(uid, 36) + ":"
+func newRegexTask(groupID, userID int64, pattern, template string, inject bool) storedJob {
+	kind := storedRegexAllText
+	if userID > 0 {
+		kind = storedRegexPrivateText
 	}
-	cr += strconv.FormatInt(gid, 36) + ":" + pattern
-	return db.Insert(bots, &cmd{
-		ID:   idof(cr, template),
-		Cron: cr,
-		Cmd:  template,
+	if inject && userID == 0 {
+		kind = storedRegexAllInject
+	} else if inject {
+		kind = storedRegexPrivateInject
+	}
+	task := storedJob{
+		Kind:    kind,
+		Matcher: pattern,
+		Command: template,
+		GroupID: groupID,
+		UserID:  userID,
+	}
+	task.ID = idof(task.legacyCron(), task.Command)
+	return task
+}
+
+func deleteRegexTasks(botID, groupID, userID int64, patterns []string, inject bool) error {
+	matchesPattern := func(pattern string) bool {
+		for _, candidate := range patterns {
+			if pattern == candidate {
+				return true
+			}
+		}
+		return false
+	}
+	deleted, err := tasks.deleteWhere(botID, func(task storedJob) (bool, error) {
+		isRegex := task.Kind == storedRegexAllText || task.Kind == storedRegexPrivateText || task.Kind == storedRegexAllInject || task.Kind == storedRegexPrivateInject
+		isInject := task.Kind == storedRegexAllInject || task.Kind == storedRegexPrivateInject
+		return isRegex && isInject == inject && task.GroupID == groupID && task.UserID == userID && matchesPattern(task.Matcher), nil
 	})
-}
-
-// isPrivate:false & id:0 is global
-func saveInjectRegex(gid, uid int64, bots, pattern, template string) error {
-	cr := "im:"
-	if uid > 0 {
-		cr = "ip:" + strconv.FormatInt(uid, 36) + ":"
+	if err != nil {
+		return err
 	}
-	cr += strconv.FormatInt(gid, 36) + ":" + pattern
-	return db.Insert(bots, &cmd{
-		ID:   idof(cr, template),
-		Cron: cr,
-		Cmd:  template,
-	})
-}
-
-// isPrivate:false & id:0 is global
-func removeRegex(gid, uid int64, bots, pattern string) error {
-	cr := "rm:"
-	if uid > 0 {
-		cr = "rp:" + strconv.FormatInt(uid, 36) + ":"
-	}
-	cr += strconv.FormatInt(gid, 36) + ":" + pattern
-	c := &cmd{}
-	var delids []int64
-	_ = db.FindFor(bots, c, "WHERE cron = ?", func() error {
-		delids = append(delids, c.ID)
-		return nil
-	}, cr)
-	if len(delids) > 0 {
-		q, s := sql.QuerySet("WHERE id", "IN", delids)
-		return db.Del(bots, q, s...)
-	}
-	return nil
-}
-
-// isPrivate:false & id:0 is global
-func removeInjectRegex(gid, uid int64, bots, pattern string) error {
-	cr := "im:"
-	if uid > 0 {
-		cr = "ip:" + strconv.FormatInt(uid, 36) + ":"
-	}
-	cr += strconv.FormatInt(gid, 36) + ":" + pattern
-	c := &cmd{}
-	var delids []int64
-	_ = db.FindFor(bots, c, "WHERE cron = ?", func() error {
-		delids = append(delids, c.ID)
-		return nil
-	}, cr)
-	if len(delids) > 0 {
-		q, s := sql.QuerySet("WHERE id", "IN", delids)
-		return db.Del(bots, q, s...)
+	if deleted == 0 {
+		return ErrRegexNotFound
 	}
 	return nil
 }
 
 func init() {
-	en.OnRegex(`^(我|大家|有人)(说|问)(.*)你(答|说|做|执行)`, zero.OnlyGroup, zero.OnlyToMe).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {
-		mu.Lock()
-		defer mu.Unlock()
+	registerRegexQuestionHandlers()
+}
 
+func registerRegexQuestionHandlers() {
+	en.OnRegex(`^(群指令)?(我|大家|有人)(说|问)(.*)你(答|说|做|执行)`, zero.OnlyGroup, zero.OnlyToMe).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {
 		matched := ctx.State["regex_matched"].([]string)
 		all := true
-		if matched[1] == "我" {
+		if matched[2] == "我" {
 			all = false
 		}
 		if all && !zero.AdminPermission(ctx) {
@@ -133,7 +133,7 @@ func init() {
 			return
 		}
 		isInject := false
-		if matched[4] == "做" || matched[4] == "执行" {
+		if matched[5] == "做" || matched[5] == "执行" {
 			if !zero.AdminPermission(ctx) {
 				ctx.SendChain(message.Text("非管理员/主人无法设置注入"))
 				return
@@ -142,47 +142,24 @@ func init() {
 		}
 		gid := ctx.Event.GroupID
 		uid := ctx.Event.UserID
-		pattern := message.UnescapeCQCodeText(matched[3])
+		pattern := message.UnescapeCQCodeText(matched[4])
 		template := strings.TrimPrefix(ctx.MessageString(), matched[0])
-		if global.group[gid] == nil {
-			global.group[gid] = &regexGroup{
-				Private: make(map[int64][]inst),
-			}
+		if all {
+			uid = 0
 		}
-		if global.group[gid].Private == nil {
-			global.group[gid].Private = make(map[int64][]inst)
-		}
-		compiled, err := regexp.Compile(transformPattern(pattern))
-		if err != nil {
-			ctx.SendChain(message.Text("ERROR:无法编译正则表达式:", err))
+		groups, selected := selectedGroupsOr(ctx, gid)
+		if matched[1] != "" && !selected {
+			ctx.SendChain(message.Text("ERROR:请先设置指令群"))
 			return
 		}
-		regexInst := inst{
-			regex:    compiled,
-			Pattern:  pattern,
-			Template: template,
-			IsInject: isInject,
+		if !selected {
+			groups = []int64{gid}
 		}
-		rg := global.group[gid]
-		if all {
-			if isInject {
-				err = saveInjectRegex(gid, 0, strconv.FormatInt(ctx.Event.SelfID, 36), pattern, template)
-			} else {
-				err = saveRegex(gid, 0, strconv.FormatInt(ctx.Event.SelfID, 36), pattern, template)
-			}
-			if err == nil {
-				rg.All = append(rg.All, regexInst)
-			}
-		} else {
-			if isInject {
-				err = saveInjectRegex(gid, uid, strconv.FormatInt(ctx.Event.SelfID, 36), pattern, template)
-			} else {
-				err = saveRegex(gid, uid, strconv.FormatInt(ctx.Event.SelfID, 36), pattern, template)
-			}
-			if err == nil {
-				rg.Private[uid] = append(rg.Private[uid], regexInst)
-			}
+		batch := make([]storedJob, len(groups))
+		for i, groupID := range groups {
+			batch[i] = newRegexTask(groupID, uid, pattern, template, isInject)
 		}
+		err := tasks.addBatch(ctx.Event.SelfID, batch)
 		if err != nil {
 			ctx.SendChain(message.Text("ERROR:无法保存正则表达式:", err))
 			return
@@ -202,7 +179,7 @@ func init() {
 			all = false
 		}
 		arg := strings.TrimPrefix(ctx.MessageString(), matched[0])
-		rg := global.group[gid]
+		rg := global.get(ctx.Event.SelfID, gid)
 		if rg == nil {
 			return
 		}
@@ -235,9 +212,6 @@ func init() {
 	})
 
 	en.OnRegex(`^删除(大家|有人|我)(说|问|让你做|让你执行)`, zero.OnlyGroup, zero.OnlyToMe).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {
-		mu.Lock()
-		defer mu.Unlock()
-
 		gid := ctx.Event.GroupID
 		uid := ctx.Event.UserID
 		matched := ctx.State["regex_matched"].([]string)
@@ -245,10 +219,6 @@ func init() {
 		escapedpattern := message.UnescapeCQCodeText(pattern)
 		if pattern == escapedpattern {
 			escapedpattern = ""
-		}
-		rg := global.group[gid]
-		if rg == nil {
-			return
 		}
 		all := true
 		if matched[1] == "我" {
@@ -266,58 +236,14 @@ func init() {
 			}
 			isInject = true
 		}
-		var deleteInst func(insts []inst) ([]inst, error)
-		if escapedpattern == "" {
-			deleteInst = func(insts []inst) ([]inst, error) {
-				for i := range insts {
-					if insts[i].Pattern == pattern {
-						insts[i] = insts[len(insts)-1]
-						insts = insts[:len(insts)-1]
-						return insts, nil
-					}
-				}
-				return insts, errors.New("没有找到对应的问答词条")
-			}
-		} else {
-			deleteInst = func(insts []inst) ([]inst, error) {
-				for i := range insts {
-					if insts[i].Pattern == pattern || insts[i].Pattern == escapedpattern {
-						insts[i] = insts[len(insts)-1]
-						insts = insts[:len(insts)-1]
-						return insts, nil
-					}
-				}
-				return insts, errors.New("没有找到对应的问答词条")
-			}
+		if all {
+			uid = 0
 		}
-		removeInDB := func(f func(int64, int64, string, string) error, gid, uid int64, bots, pattern string) (err error) {
-			err = f(gid, uid, bots, pattern)
-			if err != nil && escapedpattern == "" {
-				return
-			}
-			if escapedpattern != "" {
-				err = f(gid, uid, bots, escapedpattern)
-			}
-			return
+		patterns := []string{pattern}
+		if escapedpattern != "" {
+			patterns = append(patterns, escapedpattern)
 		}
-		var err error
-		var f func(int64, int64, string, string) error
-		if isInject {
-			f = removeInjectRegex
-		} else {
-			f = removeRegex
-		}
-		if matched[1] == "我" {
-			err = removeInDB(f, gid, uid, strconv.FormatInt(ctx.Event.SelfID, 36), pattern)
-			if err == nil {
-				rg.Private[uid], err = deleteInst(rg.Private[uid])
-			}
-		} else {
-			err = removeInDB(f, gid, 0, strconv.FormatInt(ctx.Event.SelfID, 36), pattern)
-			if err == nil {
-				rg.All, err = deleteInst(rg.All)
-			}
-		}
+		err := deleteRegexTasks(ctx.Event.SelfID, gid, uid, patterns, isInject)
 		if err != nil {
 			ctx.SendChain(message.Text("ERROR: ", err))
 			return
@@ -331,7 +257,7 @@ func init() {
 
 		gid := ctx.Event.GroupID
 		uid := ctx.Event.UserID
-		rg := global.group[gid]
+		rg := global.get(ctx.Event.SelfID, gid)
 		if rg == nil {
 			return false
 		}
