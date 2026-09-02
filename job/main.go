@@ -59,7 +59,7 @@ func init() {
 }
 
 func registerCommandHandlers() {
-	en.OnRegex(`^设置指令群\s*(.*)$`, zero.SuperUserPermission, func(ctx *zero.Ctx) bool {
+	en.OnRegex(`^设置指令群\s*(.*)$`, zero.SuperUserPermission, zero.OnlyPrivate, func(ctx *zero.Ctx) bool {
 		return strings.TrimSpace(ctx.State["regex_matched"].([]string)[1]) != ""
 	}).SetBlock(true).Handle(func(ctx *zero.Ctx) {
 		raw := ctx.State["regex_matched"].([]string)[1]
