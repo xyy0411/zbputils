@@ -122,7 +122,14 @@ func init() {
 }
 
 func registerRegexQuestionHandlers() {
-	en.OnRegex(`^(群指令)?(我|大家|有人)(说|问)(.*)你(答|说|做|执行)`, zero.OnlyGroup, zero.OnlyToMe).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {
+	en.OnRegex(`^(群指令)?(我|大家|有人)(说|问)(.*)你(答|说|做|执行)`,
+		func(ctx *zero.Ctx) bool {
+			matched := ctx.State["regex_matched"].([]string)
+			if matched[1] == "群指令" {
+				return true
+			}
+			return zero.OnlyToMe(ctx) && zero.OnlyGroup(ctx)
+		}).Limit(ctxext.LimitByGroup).Handle(func(ctx *zero.Ctx) {
 		matched := ctx.State["regex_matched"].([]string)
 		all := true
 		if matched[2] == "我" {
